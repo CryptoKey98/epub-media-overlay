@@ -581,13 +581,18 @@ def transcript_compatibility_stamp(book_info, chunk_stamp):
     Embeds the parent chunk's stamp so re-cutting the chunk (different codec, chunk
     boundaries, etc.) also invalidates the transcript that was aligned against it.
     """
-    return {
+    stamp = {
         "kind": "transcript",
         "backend": book_info.get("backend"),
         "model": book_info.get("model"),
         "language": book_info.get("language"),
         "chunk_stamp": chunk_stamp,
     }
+
+    if book_info.get("backend") == "whispercpp":
+        from transcription_backend import runtime_identity
+        stamp["whispercpp_runtime"] = runtime_identity(book_info["model"])
+    return stamp
 
 
 def write_compatibility_stamp(artifact_path, stamp):
@@ -608,7 +613,13 @@ def read_compatibility_stamp(artifact_path):
 
 def stamp_matches(artifact_path, expected_stamp):
     """True if the artifact has a stamp equal to expected_stamp."""
-    return read_compatibility_stamp(artifact_path) == expected_stamp
+    actual = read_compatibility_stamp(artifact_path)
+    if actual == expected_stamp:
+        return True
+    if expected_stamp.get("kind") == "transcript" and expected_stamp.get("backend") == "whispercpp":
+        from transcription_backend import legacy_stamp_compatible
+        return legacy_stamp_compatible(actual, expected_stamp)
+    return False
 
 
 def is_transcript_complete(book_info, chunk_basename):

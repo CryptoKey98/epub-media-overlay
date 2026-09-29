@@ -258,3 +258,62 @@ def test_split_reconcile_prunes_chunks_outside_the_plan(tmp_path, monkeypatch):
     assert not (paths.run_dir / "099.m4a").exists()
     assert not (paths.run_dir / "099.json").exists()
     assert (paths.run_dir / "000.json").exists()
+
+# --- match execution after upstream invalidation -----------------------------
+
+import logging
+import pytest
+
+
+@pytest.mark.parametrize("version", ["2.0", "3.0"])
+@pytest.mark.parametrize("invalidated_by", ["split", "transcribe"])
+@pytest.mark.parametrize("resume", [False, True])
+def test_match_restores_epub_after_upstream_invalidation(
+    tmp_path, monkeypatch, version, invalidated_by, resume
+):
+    config, paths = _config_and_paths(tmp_path)
+    with zipfile.ZipFile(config.epub, "w") as zf:
+        zf.writestr("OEBPS/content.opf", _OPF.replace('version="3.0"', f'version="{version}"'))
+    source_bytes = config.epub.read_bytes()
+    state, _ = geo.initialize_state(config, paths)
+    logger = logging.getLogger(__name__)
+    geo.execute_stage("prepare", config, paths, state, logger)
+    audio = paths.run_dir / "000.m4a"
+    transcript = paths.run_dir / "000.json"
+    audio.write_bytes(b"cached audio")
+    transcript.write_bytes(b"cached transcript")
+    _touch(paths.segmented_snapshot_path, paths.output_path, paths.validation_path)
+    geo.invalidate_downstream(invalidated_by, config, paths, state)
+    assert not paths.working_epub_path.exists()
+    assert not paths.segmented_snapshot_path.exists()
+    assert not paths.output_path.exists()
+    assert not paths.validation_path.exists()
+
+    if resume:
+        geo.save_state(paths, state)
+        state, mode = geo.initialize_state(config, paths)
+        assert mode == "resume"
+        assert geo.reconcile_stage_from_artifacts("prepare", config, paths, state) is None
+        geo.execute_stage("prepare", config, paths, state, logger)
+        # Complete cached split/transcribe stages are skipped on a normal retry.
+
+    matched = [{"json_file": "000.json", "html_file": "OEBPS/ch1.xhtml"}]
+
+    def match_existing_epub(book_info):
+        working = Path(pc.resolve_book_path(book_info, book_info["epub_file"]))
+        assert working == paths.working_epub_path
+        assert working.read_bytes() == source_bytes
+        return matched
+
+    monkeypatch.setattr(pc, "link_html_with_audio", match_existing_epub)
+    monkeypatch.setattr(geo, "expected_audio_files", lambda *args: (["000.m4a"], []))
+    result = geo.execute_stage("match", config, paths, state, logger)
+    assert result["match_count"] == 1
+    assert json.loads(paths.matched_list_path.read_text()) == matched
+    assert state["book_info"]["out_file"] == paths.working_epub_path.name
+    assert config.epub.read_bytes() == source_bytes
+    assert audio.read_bytes() == b"cached audio"
+    assert transcript.read_bytes() == b"cached transcript"
+    # Matching must still invalidate stale segmentation; segment refreshes next.
+    geo.invalidate_downstream("match", config, paths, state)
+    assert not paths.working_epub_path.exists()

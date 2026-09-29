@@ -2,3 +2,12 @@ __pycache__/
 run.py
 *.py[cod]
 .DS_Store
+
+# Local whisper.cpp executable, DLLs and GGML models
+.whispercpp/
+
+# Local Python environments and installation-test caches
+.venv/
+.venv-*/
+.install-test/
+.pytest_cache/

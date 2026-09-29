@@ -276,6 +276,8 @@ def configure_logging(paths: RuntimePaths) -> logging.Logger:
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
+    # Keep per-chunk diagnostics in the log without interrupting tqdm.
+    stream_handler.addFilter(lambda record: not getattr(record, "file_only", False))
     logger.addHandler(stream_handler)
 
     file_handler = logging.FileHandler(paths.logs_dir / "pipeline.log", encoding="utf-8")
@@ -420,6 +422,13 @@ def parse_args() -> PipelineConfig:
     )
     backend = args.backend or detect_transcription_backend()
     model = args.model or default_model_for_backend(backend)
+    if backend == "whispercpp":
+        from transcription_backend import resolve_model
+        previous = load_json_if_exists(work_dir / "state.json") or {}
+        previous_model = None
+        if previous.get("config", {}).get("backend") == "whispercpp":
+            previous_model = previous["config"].get("model")
+        model = str(resolve_model(model, previous_model=previous_model))
     audio_bitrate = resolve_audio_bitrate(args.audio_codec, args.audio_bitrate)
     audio_sample_rate = resolve_audio_sample_rate(args.audio_codec, args.audio_sample_rate)
     audio_channels = resolve_audio_channels(args.audio_codec, args.audio_channels)
@@ -480,6 +489,9 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
             f"Missing Python dependency: {module_name}. Install the pipeline requirements before running."
         ) from exc
 
+    if config.backend == "whispercpp":
+        from transcription_backend import preflight as whispercpp_preflight
+        whispercpp_preflight(config.model, logger)
     ensure_nltk_resources(logger)
 
 
@@ -1055,11 +1067,21 @@ def run_transcribe_stage(
 
 
 def run_match_stage(
+    config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
+    # Split/transcribe invalidation removes the working EPUB because it also
+    # holds downstream segment IDs. Matching needs that file before segment
+    # gets a chance to refresh it, including on a fresh run.
+    working_epub = paths.run_dir / book_info["epub_file"]
+    if not working_epub.is_file():
+        book_info = refresh_working_epub(config, paths)
+        state["book_info"] = book_info
+        state["artifacts"]["prepared_epub"] = str(paths.run_dir / book_info["out_file"])
+        logger.info("Restored working EPUB for matching at %s", paths.run_dir / book_info["out_file"])
     matched_list = pipeline_core.link_html_with_audio(book_info)
     if not matched_list:
         raise RuntimeError("Matching stage produced an empty matched list")
@@ -1177,7 +1199,7 @@ def execute_stage(
     if stage == "transcribe":
         return run_transcribe_stage(config, paths, state, logger)
     if stage == "match":
-        return run_match_stage(paths, state, logger)
+        return run_match_stage(config, paths, state, logger)
     if stage == "segment":
         return run_segment_stage(config, paths, state, logger)
     if stage == "smil":

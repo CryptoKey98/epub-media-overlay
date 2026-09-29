@@ -1,7 +1,21 @@
+# Shared pipeline dependencies
 beautifulsoup4
 lxml
 nltk
-pytest
 tqdm
+
+# Platform defaults. WhisperX also provides CPU word alignment for whispercpp;
+# keep it installed when using an AMD/Vulkan GPU on Windows or Linux.
 whisperx ; platform_system != "Darwin" or platform_machine != "arm64"
 mlx-whisperx ; platform_system == "Darwin" and platform_machine == "arm64"
+
+# whispercpp: pip-installed Windows x64 Vulkan runtime and cached GGML models.
+whispercpp-vulkan-runtime @ https://github.com/CryptoKey98/whispercpp-vulkan-runtime/releases/latest/download/whispercpp_vulkan_runtime-1.8.5.1-py3-none-win_amd64.whl ; platform_system == "Windows" and (platform_machine == "AMD64" or platform_machine == "x86_64")
+huggingface-hub>=0.24,<1.0
+
+# Test suite
+pytest
+
+# Install separately: FFmpeg (ffmpeg + ffprobe) on PATH.
+# whispercpp additionally needs a Vulkan-capable GPU/driver; the pip runtime
+# requires Windows x64 and an AVX2-capable CPU. No CUDA or Vulkan SDK is required.
