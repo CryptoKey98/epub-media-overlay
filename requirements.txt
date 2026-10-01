@@ -4,6 +4,11 @@ lxml
 nltk
 tqdm
 
+# Windows x64 uses one ONNX Runtime distribution for CPU and DirectML execution.
+./packages/faster_whisper-1.2.1+directml1-py3-none-any.whl ; platform_system == "Windows" and (platform_machine == "AMD64" or platform_machine == "x86_64")
+onnxruntime-directml==1.23.0 ; platform_system == "Windows" and (platform_machine == "AMD64" or platform_machine == "x86_64")
+onnx==1.23.1 ; platform_system == "Windows" and (platform_machine == "AMD64" or platform_machine == "x86_64")
+
 # Platform defaults. WhisperX also provides CPU word alignment for whispercpp;
 # keep it installed when using an AMD/Vulkan GPU on Windows or Linux.
 whisperx ; platform_system != "Darwin" or platform_machine != "arm64"

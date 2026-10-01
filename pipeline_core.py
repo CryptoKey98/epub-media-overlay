@@ -589,6 +589,10 @@ def transcript_compatibility_stamp(book_info, chunk_stamp):
         "chunk_stamp": chunk_stamp,
     }
 
+    alignment = book_info.get("alignment_backend", "auto")
+    if alignment == "directml" or (alignment == "cpu" and book_info.get("backend") == "whisperx"):
+        stamp["alignment_backend"] = alignment
+        stamp["alignment_version"] = 1
     if book_info.get("backend") == "whispercpp":
         from transcription_backend import runtime_identity
         stamp["whispercpp_runtime"] = runtime_identity(book_info["model"])
@@ -873,6 +877,7 @@ def transcribe_audio(book_info):
                     language,
                     backend,
                     batch_size,
+                    **({"alignment_backend": book_info["alignment_backend"]} if book_info.get("alignment_backend", "auto") != "auto" else {}),
                 )
         except Exception as exc:
             error_output = (stderr_buffer.getvalue() or stdout_buffer.getvalue()).strip()

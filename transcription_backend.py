@@ -68,16 +68,23 @@ def transcribe_file(
     language: str,
     backend: str,
     batch_size: int,
+    alignment_backend: str = "auto",
 ) -> dict[str, Any]:
+    if alignment_backend not in {"auto", "cpu", "directml"}:
+        raise ValueError(f"Unknown alignment backend: {alignment_backend}")
+    if alignment_backend == "directml" and (backend not in {BACKEND_WHISPERCPP, BACKEND_WHISPERX} or language != "en"):
+        raise ValueError("DirectML alignment currently requires whispercpp or whisperx and English")
+    if backend == BACKEND_MLX and alignment_backend != "auto":
+        raise ValueError("MLX supports only automatic alignment")
     if backend == BACKEND_MLX:
         return _transcribe_with_mlx(file_path, model, language, batch_size)
     if backend == BACKEND_WHISPERCPP:
-        result = transcribe_segments(file_path, model, language)
+        result = _cached_cpp_segments(file_path, model, language)
         whisperx = importlib.import_module("whisperx")
         audio = whisperx.load_audio(file_path)
-        return _align_result(whisperx, result, audio, language, "cpu")
+        return _align_result(whisperx, result, audio, language, "cpu", alignment_backend)
     if backend == BACKEND_WHISPERX:
-        return _transcribe_with_whisperx(file_path, model, language, batch_size)
+        return _transcribe_with_whisperx(file_path, model, language, batch_size, alignment_backend)
     raise ValueError(f"Unknown transcription backend: {backend}")
 
 
@@ -136,6 +143,7 @@ def _transcribe_with_whisperx(
     model: str,
     language: str,
     batch_size: int,
+    alignment_backend: str = "auto",
 ) -> dict[str, Any]:
     whisperx = importlib.import_module("whisperx")
     torch = _import_torch()
@@ -152,10 +160,13 @@ def _transcribe_with_whisperx(
     audio = whisperx.load_audio(file_path)
     result = model_obj.transcribe(audio, batch_size=batch_size, language=language)
 
-    return _align_result(whisperx, result, audio, language, device)
+    alignment_device = "cpu" if alignment_backend in {"cpu", "directml"} else device
+    if alignment_backend == "directml":
+        return _align_result(whisperx, result, audio, language, alignment_device, "directml")
+    return _align_result(whisperx, result, audio, language, alignment_device)
 
 
-def _align_result(whisperx, result, audio, language, device):
+def _align_result(whisperx, result, audio, language, device, alignment_backend="cpu"):
     """Share word alignment and its model cache across transcription engines."""
     align_language = result.get("language") or language
     if not result.get("segments"):
@@ -166,6 +177,14 @@ def _align_result(whisperx, result, audio, language, device):
             language_code=align_language, device=device
         )
     model_a, metadata = _WHISPERX_ALIGN_MODELS[align_key]
+
+    if alignment_backend == "directml":
+        if align_language != "en" or metadata.get("type") != "torchaudio":
+            raise ValueError("Experimental DirectML alignment currently supports English torchaudio alignment only")
+        key = (align_language, id(model_a))
+        if key not in _DIRECTML_MODELS:
+            _DIRECTML_MODELS[key] = _DirectMLAlignment(model_a)
+        model_a = _DIRECTML_MODELS[key]
 
     aligned = whisperx.align(
         result["segments"],
@@ -190,6 +209,7 @@ def release_models() -> None:
     """Drop cached models and return their memory. Call once after transcription."""
     _WHISPERX_MODELS.clear()
     _WHISPERX_ALIGN_MODELS.clear()
+    _DIRECTML_MODELS.clear()
     gc.collect()
     torch = _import_torch()
     if torch is not None and torch.cuda.is_available():
@@ -304,7 +324,7 @@ def preflight(model: str, logger=None) -> None:
     for line in diagnostics.splitlines():
         if "ggml_vulkan:" in line:
             logger.info("%s", line)
-    logger.info("whispercpp: Vulkan transcription; WhisperX word alignment on CPU; batch-size is unused")
+    logger.info("whispercpp: Vulkan transcription; batch-size is unused")
 
 
 def parse_segments(payload: dict, duration: float) -> dict:
@@ -402,3 +422,105 @@ def ensure_model(model: str) -> Path:
         except Exception as exc:
             raise RuntimeError(f"Could not download GGML model {model!r}. Check the connection, "
                                "or pass an existing .bin file with --model.") from exc
+
+
+_DIRECTML_MODELS = {}
+
+
+def check_directml():
+    if platform.system() != "Windows":
+        raise RuntimeError("Experimental DirectML alignment requires Windows")
+    try:
+        import onnx
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError("Install the repository requirements in this environment: python -m pip install -r requirements.txt") from exc
+    if "DmlExecutionProvider" not in ort.get_available_providers():
+        raise RuntimeError("DirectML provider is unavailable; follow the README runtime migration steps, then reinstall requirements.txt")
+    return ort
+
+
+class _DirectMLAlignment:
+    """GPU acoustic inference; WhisperX timestamp processing remains on CPU."""
+    def __init__(self, model):
+        import torch
+
+        ort = check_directml()
+        self.model = model.eval()
+        self.failed = False
+        digest = hashlib.sha256(b"whisperx-en-onnx-opset17-v1")
+        digest.update(torch.__version__.encode())
+        for name, tensor in model.state_dict().items():
+            digest.update(name.encode())
+            digest.update(tensor.detach().cpu().numpy().tobytes())
+        cache = Path.home() / ".cache" / "epub-media-overlay" / "alignment"
+        cache.mkdir(parents=True, exist_ok=True)
+        target = cache / (digest.hexdigest() + ".onnx")
+        if not target.exists():
+            class Export(torch.nn.Module):
+                def __init__(self, inner):
+                    super().__init__()
+                    self.inner = inner
+                def forward(self, waveform):
+                    return self.inner(waveform)[0]
+            fd, temp = tempfile.mkstemp(suffix=".onnx", dir=cache)
+            os.close(fd)
+            try:
+                torch.onnx.export(Export(model).eval(), torch.zeros(1, 16000), temp,
+                    input_names=["waveform"], output_names=["logits"],
+                    dynamic_axes={"waveform": {1: "samples"}, "logits": {1: "frames"}},
+                    opset_version=17, dynamo=False)
+                import onnx
+                onnx.checker.check_model(temp)
+                os.replace(temp, target)
+            finally:
+                Path(temp).unlink(missing_ok=True)
+        options = ort.SessionOptions()
+        options.enable_mem_pattern = False
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.intra_op_num_threads = 1
+        self.session = ort.InferenceSession(str(target), sess_options=options,
+            providers=[("DmlExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"])
+        self.session.disable_fallback()
+        if "DmlExecutionProvider" not in self.session.get_providers():
+            raise RuntimeError("DirectML alignment session did not initialize")
+        _LOG.info("Experimental DirectML alignment enabled; timestamp processing and unsupported operations use CPU")
+
+    def __call__(self, waveform, lengths=None):
+        import torch
+
+        if lengths is not None or self.failed:
+            return self.model(waveform, lengths=lengths)
+        try:
+            logits = self.session.run(["logits"], {"waveform": waveform.detach().cpu().numpy()})[0]
+            return torch.from_numpy(logits), None
+        except Exception:
+            self.failed = True
+            _LOG.warning("DirectML inference failed; using CPU alignment for the rest of this run", exc_info=True)
+            return self.model(waveform, lengths=lengths)
+
+
+def _cached_cpp_segments(file_path, model, language):
+    # Preserve ASR separately so alignment changes/failures do not repeat ASR.
+    audio = Path(file_path)
+    digest = hashlib.sha256()
+    with audio.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    identity = {"audio_sha256": digest.hexdigest(), "runtime": runtime_identity(model), "language": language}
+    cache = audio.with_name(audio.name + ".asr.json")
+    try:
+        saved = json.loads(cache.read_text(encoding="utf-8"))
+        if saved.get("identity") == identity and isinstance(saved.get("result", {}).get("segments"), list):
+            return saved["result"]
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    result = transcribe_segments(file_path, model, language)
+    fd, temporary = tempfile.mkstemp(dir=audio.parent, suffix=".asr.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump({"identity": identity, "result": result}, out)
+        os.replace(temporary, cache)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return result

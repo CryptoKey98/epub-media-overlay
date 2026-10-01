@@ -73,6 +73,7 @@ class PipelineConfig:
     chunk_seconds: int
     batch_size: int
     mlx_cache_gb: float | None
+    alignment_backend: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
         },
         "config": {
             "backend": config.backend,
+            "alignment_backend": config.alignment_backend,
             "model": config.model,
             "language": config.language,
             "audio_extension": config.audio_extension,
@@ -248,6 +250,7 @@ def build_signature(config: PipelineConfig) -> dict[str, Any]:
         "audio": fingerprint_file(config.audio),
         "epub": fingerprint_file(config.epub),
         "backend": config.backend,
+        **({"alignment_backend": config.alignment_backend} if config.alignment_backend != "auto" else {}),
         "model": config.model,
         "language": config.language,
         "audio_extension": config.audio_extension,
@@ -302,6 +305,8 @@ def parse_args() -> PipelineConfig:
         "--work-dir",
         help="Working directory used for persistent state and intermediate artifacts",
     )
+    parser.add_argument("--alignment-backend", choices=("auto", "cpu", "directml"), default="auto",
+        help="Word alignment: auto (default), cpu, or experimental Windows English directml")
     parser.add_argument(
         "--backend",
         choices=BACKENDS,
@@ -421,6 +426,10 @@ def parse_args() -> PipelineConfig:
         else output_dir / f".{epub.stem}.epubmo"
     )
     backend = args.backend or detect_transcription_backend()
+    if args.alignment_backend == "directml" and (backend not in {"whispercpp", "whisperx"} or args.language != "en"):
+        raise ValueError("Experimental DirectML alignment requires --backend whispercpp or whisperx, with --language en")
+    if backend == "mlx" and args.alignment_backend != "auto":
+        raise ValueError("MLX currently supports only --alignment-backend auto")
     model = args.model or default_model_for_backend(backend)
     if backend == "whispercpp":
         from transcription_backend import resolve_model
@@ -440,6 +449,7 @@ def parse_args() -> PipelineConfig:
         output_dir=output_dir,
         work_dir=work_dir,
         backend=backend,
+        alignment_backend=args.alignment_backend,
         model=model,
         language=args.language,
         audio_extension=args.audio_extension,
@@ -478,6 +488,9 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
         raise FileNotFoundError(f"Input EPUB not found: {config.epub}")
     if config.epub.suffix.lower() != ".epub":
         raise ValueError(f"Expected an .epub input, got: {config.epub}")
+    if config.alignment_backend == "directml":
+        from transcription_backend import check_directml
+        check_directml()
     ensure_command("ffprobe")
     ensure_command("ffmpeg")
     # Core libraries are imported at module load; only the ASR backend is lazy.
@@ -663,6 +676,7 @@ def book_info_from_config(config: PipelineConfig, paths: RuntimePaths) -> dict[s
         "chunk_seconds": config.chunk_seconds,
         "batch_size": config.batch_size,
         "backend": config.backend,
+        "alignment_backend": config.alignment_backend,
         "model": config.model,
         "language": config.language,
     }
@@ -1041,6 +1055,7 @@ def run_transcribe_stage(
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
     book_info["backend"] = config.backend
+    book_info["alignment_backend"] = config.alignment_backend
     book_info["model"] = config.model
     book_info["language"] = config.language
     book_info["batch_size"] = config.batch_size

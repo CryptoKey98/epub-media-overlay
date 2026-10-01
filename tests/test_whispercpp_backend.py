@@ -124,7 +124,7 @@ def test_cpp_uses_cpu_alignment_and_shared_cache(monkeypatch):
     fake = types.SimpleNamespace(load_audio=lambda p: [], load_align_model=load_align_model, align=align)
     monkeypatch.setitem(sys.modules, "whisperx", fake)
     monkeypatch.setattr(tb, "_WHISPERX_ALIGN_MODELS", {})
-    monkeypatch.setattr(cpp, "transcribe_segments", lambda *a: cpp.parse_segments(_payload(), 2))
+    monkeypatch.setattr(cpp, "_cached_cpp_segments", lambda *a: cpp.parse_segments(_payload(), 2))
     for _ in range(2):
         result = tb.transcribe_file("audio.m4a", "small", "en", "whispercpp", 1)
         assert result["word_segments"][0]["word"] == "Hello"

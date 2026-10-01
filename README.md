@@ -24,13 +24,14 @@ All three backends are integrated in `transcription_backend.py`:
 
 | Backend option | Transcription | Word alignment | Selection |
 | --- | --- | --- | --- |
-| `whisperx` | NVIDIA CUDA when available, otherwise CPU | WhisperX on the selected device | Default outside Apple Silicon |
+| `whisperx` | NVIDIA CUDA when available, otherwise CPU | WhisperX on the selected device; experimental DirectML available | Default outside Apple Silicon |
 | `mlx` | Apple Silicon using MLX | mlx-whisperx | Default on Apple Silicon |
-| `whispercpp` | Vulkan GPU, including AMD | WhisperX on CPU | Select explicitly |
+| `whispercpp` | Vulkan GPU, including AMD | WhisperX on CPU by default; experimental DirectML available | Select explicitly |
 
 For the pip-installed whispercpp runtime, use **Windows x64, an AVX2/FMA/F16C-capable CPU, a Vulkan-capable GPU with its graphics driver installed, and the Microsoft Visual C++ v14 x64 Redistributable**. CUDA, a compiler, and the Vulkan SDK are not needed to run it. Automatic runtime installation is Windows x64 only; other systems require a compatible Vulkan executable through `WHISPERCPP_BINARY` and the WhisperX alignment dependency.
 
-Install Python dependencies into your virtual environment:
+Install Python dependencies into your virtual environment **from the repository root**
+(the requirements include a bundled dependency wheel):
 
 ```bash
 python -m pip install -r requirements.txt
@@ -45,7 +46,8 @@ ffmpeg -version
 ffprobe -version
 ```
 
-Reuse an existing virtual environment if you already have one. `requirements.txt` includes `huggingface-hub` for whispercpp model downloads and the Windows x64 `whispercpp-vulkan-runtime` wheel for the executable and DLLs. **Keep WhisperX installed when using whispercpp:** it supplies word alignment on CPU. FFmpeg and GPU drivers are system requirements, not Python packages.
+For an existing Windows environment with standard ONNX Runtime installed, follow
+the [runtime migration steps](#experimental-directml-setup) before reinstalling. `requirements.txt` includes `huggingface-hub` for whispercpp model downloads and the Windows x64 `whispercpp-vulkan-runtime` wheel for the executable and DLLs. **Keep WhisperX installed when using whispercpp:** it supplies the word alignment model and timestamp processing. FFmpeg and GPU drivers are system requirements, not Python packages.
 
 Pip installs the whispercpp executable and DLLs into the active environment and creates `Scripts/whispercpp.exe`. Models download separately into the Hugging Face cache on first use. No vendor archive or separate runtime installer is required. See [AMD GPU setup and storage](#amd-gpu-transcription-with-whispercpp-optional) below.
 
@@ -189,6 +191,17 @@ The `--language` setting is used for both transcription and HTML sentence segmen
   - Apple Silicon macOS: `mlx`
   - other platforms: `whisperx`
 
+`--alignment-backend`
+
+- Optional; controls word alignment independently of the transcription backend.
+- Supported values: `auto`, `cpu`, `directml`
+- Default: `auto`. Omitting the flag is equivalent to explicitly selecting `auto`.
+- `auto` preserves the existing backend behavior: WhisperX uses CUDA when available, otherwise CPU; whisper.cpp uses CPU alignment; MLX uses its existing alignment.
+- `cpu` forces CPU word alignment for WhisperX or whisper.cpp without changing the transcription device.
+- `directml` enables experimental GPU alignment on Windows; currently requires `--backend whispercpp` or `--backend whisperx`, with `--language en` and the optional DirectML dependencies.
+- MLX supports only `auto`.
+- See [Experimental DirectML setup](#experimental-directml-setup) for dependencies, limitations, and a command example.
+
 `--language`
 
 - Optional.
@@ -313,7 +326,7 @@ If `ffmpeg` or `ffprobe` are missing, install them and ensure they are on `PATH`
 
 If the first run cannot download NLTK data automatically, make sure the machine has network access and write permission for `~/.cache/epub-media-overlay/nltk_data`.
 
-If a run is interrupted, rerun the same command with the same work directory. Completed compatible chunk transcripts are reused; an unfinished chunk restarts from its beginning. With whispercpp, the progress bar advances when a chunk finishes, so a long chapter can remain at 0% while transcription and CPU alignment are running.
+If a run is interrupted, rerun the same command with the same work directory. Completed compatible chunk transcripts are reused; an unfinished chunk restarts from its beginning. With whispercpp, the progress bar advances when a chunk finishes, so a long chapter can remain at 0% while transcription and word alignment are running.
 
 For whispercpp GPU detection errors, check your graphics driver and Vulkan support. The backend reports an error when GPU execution cannot be confirmed. For a missing runtime package, run `python -m pip install -r requirements.txt` in the same Python environment used to run the program. The pipeline log contains per-chunk GPU diagnostics.
 
@@ -321,7 +334,8 @@ For whispercpp GPU detection errors, check your graphics driver and Vulkan suppo
 ## AMD GPU transcription with whisper.cpp (optional)
 
 Select `--backend whispercpp --model small` for Vulkan GPU transcription followed
-by WhisperX forced word alignment on CPU. The remaining matching, SMIL, packaging,
+by WhisperX forced word alignment on CPU by default. Experimental DirectML alignment
+is available for English on Windows (see below). The remaining matching, SMIL, packaging,
 and validation stages use the existing pipeline. Default backend selection is
 unchanged; this backend is opt-in. `--batch-size` does not affect whisper.cpp.
 
@@ -383,3 +397,98 @@ GPU selection is shown once at startup. Per-chunk GPU diagnostics and timings go
 only to the pipeline log, so the console progress bar updates in place.
 
 Different transcription backends can produce different text and segment boundaries with the same model size.
+
+
+### Word alignment selection
+
+Use `--alignment-backend` to choose how word timestamps are produced independently
+of speech recognition. Omitting it is equivalent to `--alignment-backend auto`.
+
+| Option | Behavior |
+| --- | --- |
+| `auto` (default) | Preserves existing behavior: WhisperX uses CUDA when available, otherwise CPU; whisper.cpp uses CPU alignment; MLX uses its existing alignment. |
+| `cpu` | Forces CPU alignment for WhisperX or whisper.cpp, without changing the transcription device. |
+| `directml` | Experimental GPU alignment for English with whisper.cpp or WhisperX on Windows. |
+
+MLX currently accepts only `auto`. DirectML itself is not language-specific; this
+integration currently supports only the English alignment model. A compatible
+DirectX 12 GPU and driver are required. DirectML supports AMD, NVIDIA, and Intel
+GPUs; this project has not validated performance on every supported device.
+
+### Experimental DirectML setup
+
+On Windows x64, `requirements.txt` installs `onnxruntime-directml==1.23.0`
+as the single ONNX Runtime distribution, plus `onnx==1.23.1` for model export.
+DirectML alignment remains opt-in; the default is still `auto`.
+
+The repository includes a dependency-only patch of faster-whisper, version
+`1.2.1+directml1`, so its Windows dependency accepts the DirectML runtime.
+Its inference code, models, and upstream licenses are unchanged. The DirectML
+runtime supplies CPU execution for faster-whisper's ONNX voice detection;
+WhisperX's normal CPU/CUDA alignment continues to use PyTorch.
+See [package provenance and rebuild instructions](packages/README.md).
+NVIDIA CUDA operation with this package combination has not been hardware-tested.
+
+For a fresh environment, run from the repository root:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+For an existing environment that has standard `onnxruntime`, remove both runtime
+distributions before reinstalling. They own overlapping files, so uninstalling
+only one can leave the other incomplete. Stop running pipeline processes first.
+
+```powershell
+python -m pip uninstall -y onnxruntime onnxruntime-directml
+python -m pip install -r requirements.txt
+python -m pip check
+```
+
+Use this repository's requirements when updating dependencies. Independently
+upgrading faster-whisper to an upstream version can bring standard `onnxruntime`
+back into the environment. Other platforms retain the standard runtime dependency.
+
+Run from the repository directory:
+
+```powershell
+python generate_epub_overlay.py `
+  --audio "..\Audiobooks\Example.m4b" `
+  --epub "..\EPUB\Example.epub" `
+  --backend whispercpp `
+  --alignment-backend directml `
+  --model small `
+  --language en `
+  --output-dir "..\Media Overlays" `
+  --work-dir "..\Overlay Work\Example-directml"
+```
+
+To use WhisperX transcription with the same DirectML alignment, replace
+`--backend whispercpp` with `--backend whisperx`. WhisperX still selects CUDA
+when available, otherwise CPU, for transcription; alignment uses DirectML with
+CPU timestamp processing. Separate ASR caching described below applies only to
+whisper.cpp, so changing alignment for WhisperX repeats transcription.
+
+PowerShell displays `>>` as its continuation prompt; do not paste those characters.
+Use a separate work/output directory when comparing results you want to retain.
+
+On first use, the program exports and caches the English alignment model under
+`~/.cache/epub-media-overlay/alignment`. DirectML accelerates acoustic model
+inference; timestamp processing and unsupported operations still use CPU. Very
+short segments that require a length mask also use CPU. An inference error logs
+a warning and switches that alignment model to CPU for the remainder of the run.
+Missing dependencies, model export errors, or session initialization errors stop
+the run rather than silently accepting an unavailable DirectML backend.
+
+### Alignment caching and resume
+
+New whisper.cpp transcriptions save an `.asr.json` beside each audio chunk before
+word alignment starts. This allows a different alignment selection, or a restart
+after an alignment interruption, to reuse completed speech recognition when the
+audio, language, model, and runtime identities still match.
+
+The aligned transcript cache distinguishes DirectML from default CPU alignment.
+Older transcripts without a separate ASR cache require one new transcription
+when changing alignment. Work within an interrupted ASR chunk is repeated; an
+interrupted alignment step also restarts rather than resuming at an individual word.
